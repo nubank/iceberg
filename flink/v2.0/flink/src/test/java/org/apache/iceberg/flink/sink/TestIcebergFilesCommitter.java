@@ -1076,6 +1076,104 @@ public class TestIcebergFilesCommitter extends TestBase {
     }
   }
 
+  /**
+   * Reproduces a data loss bug triggered by the combination of:
+   *
+   * <ol>
+   *   <li>Unaligned checkpoints: {@code snapshotState(N)} fires before all upstream writer
+   *       subtasks have delivered their write results for checkpoint N.
+   *   <li>Checkpoint N subsequently fails (no {@code notifyCheckpointComplete(N)} is called).
+   * </ol>
+   *
+   * <p>Under these conditions, {@code writeToManifestUptoLatestCheckpoint} overwrites the {@code
+   * dataFilesPerCheckpoint[N]} entry that was written during {@code snapshotState(N)} with only the
+   * late-arriving write results, silently discarding the earlier writer subtask's data.
+   *
+   * <p>Sequence of events being simulated (two upstream writer subtasks, parallelism 2):
+   *
+   * <pre>
+   *   processElement(dataA, cp=1)   writer subtask 2/2 delivers its result before snapshotState
+   *   snapshotState(1)              fires; writes manifest(dataA) to dataFilesPerCheckpoint[1]
+   *   processElement(dataB, cp=1)   writer subtask 1/2 delivers its result AFTER snapshotState(1)
+   *                                 (simulates unaligned checkpoint: slow subtask's barrier arrives late)
+   *   -- checkpoint 1 FAILS: no notifyCheckpointComplete(1), key 1 is never cleared --
+   *   processElement(dataC, cp=2)   write result for next checkpoint
+   *   snapshotState(2)              writeResultsSinceLastSnapshot = {1:[dataB], 2:[dataC]}
+   *                                 BUG: dataFilesPerCheckpoint.put(1, manifest(dataB)) overwrites
+   *                                      the existing manifest(dataA) entry for key 1
+   *   notifyCheckpointComplete(2)   commits cp1=manifest(dataB) + cp2=manifest(dataC); dataA LOST
+   * </pre>
+   */
+  @TestTemplate
+  public void testLateWriteResultsForFailedCheckpointCausesDataLoss() throws Exception {
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<FlinkWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(0);
+      assertMaxCommittedCheckpointId(jobId, operatorId, -1L);
+
+      // Data from the fast writer subtask — delivered before snapshotState fires for cp1
+      RowData rowA = SimpleDataUtil.createRowData(1, "writer-2-early");
+      DataFile dataFileA = writeDataFile("data-A", ImmutableList.of(rowA));
+
+      // Data from the slow writer subtask — delivered AFTER snapshotState(cp1) has already fired
+      RowData rowB = SimpleDataUtil.createRowData(2, "writer-1-late");
+      DataFile dataFileB = writeDataFile("data-B", ImmutableList.of(rowB));
+
+      // Data belonging to the subsequent checkpoint
+      RowData rowC = SimpleDataUtil.createRowData(3, "data-cp2");
+      DataFile dataFileC = writeDataFile("data-C", ImmutableList.of(rowC));
+
+      long cp1 = 1;
+      long cp2 = 2;
+
+      // Fast subtask's write result for cp1 arrives before snapshotState(1)
+      harness.processElement(of(cp1, dataFileA), ++timestamp);
+
+      // snapshotState(1): writeResultsSinceLastSnapshot = {1:[dataA]}
+      // writeToManifestUptoLatestCheckpoint writes manifest(dataA) → dataFilesPerCheckpoint[1]
+      harness.snapshot(cp1, ++timestamp);
+      assertFlinkManifests(1);
+
+      // Slow subtask's write result for cp1 arrives AFTER snapshotState(1) already fired.
+      // writeResultsSinceLastSnapshot[1] = [dataB]; dataFilesPerCheckpoint[1] still = manifest(dataA)
+      harness.processElement(of(cp1, dataFileB), ++timestamp);
+
+      // Checkpoint 1 FAILS: notifyCheckpointComplete(1) is never called.
+      // dataFilesPerCheckpoint[1] is NOT cleared by pendingMap.clear().
+
+      // Write result for cp2
+      harness.processElement(of(cp2, dataFileC), ++timestamp);
+
+      // snapshotState(2): writeResultsSinceLastSnapshot = {1:[dataB], 2:[dataC]}
+      // writeToManifestUptoLatestCheckpoint(2) iterates the map and calls:
+      //   dataFilesPerCheckpoint.put(1, manifest(dataB))  ← plain put OVERWRITES manifest(dataA)!
+      //   dataFilesPerCheckpoint.put(2, manifest(dataC))
+      // manifest(dataA) is now orphaned on storage and will never be committed.
+      harness.snapshot(cp2, ++timestamp);
+
+      // if notifyComplete(1) happens here - after snapshot 2 was "triggered"
+      // - we would also have data loss. So this does not completely depend
+
+      // notifyCheckpointComplete(2): commitUpToCheckpoint reads headMap up to cp2:
+      //   {1: manifest(dataB), 2: manifest(dataC)}
+      // dataA is silently lost — its data file is never included in any Iceberg commit.
+      harness.notifyOfCompletedCheckpoint(cp2);
+
+      // All three rows must be present in the table.
+      // With the current code this assertion FAILS: only rowB and rowC are committed;
+      // rowA is lost because dataFilesPerCheckpoint[1] was overwritten before the commit.
+      SimpleDataUtil.assertTableRows(table, ImmutableList.of(rowA, rowB, rowC), branch);
+      assertMaxCommittedCheckpointId(jobId, operatorId, cp2);
+    }
+  }
+
   private int getStagingManifestSpecId(OperatorStateStore operatorStateStore, long checkPointId)
       throws Exception {
     ListState<SortedMap<Long, byte[]>> checkpointsState =
